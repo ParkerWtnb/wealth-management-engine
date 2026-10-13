@@ -53,7 +53,7 @@ class BST:
 
 bst = BST()
 script_dir = os.path.dirname(os.path.abspath(__file__))
-
+# TODO: Implement csv.DictReader to handle misaligned columns across WS and TD schemas
 csv_files = ["td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv"]
 for filename in csv_files:
     file_path = os.path.join(script_dir, filename)
@@ -63,19 +63,78 @@ for filename in csv_files:
     with open(file_path, mode = 'r', encoding='utf-8') as csvfile:
         reader = csv.reader(csvfile)
 
-        for row in reader:
-            if row is not None:
-                if "transaction" in row[1].lower():
-                    continue #skip header
-                transaction = Transaction(row[0], row[1], row[2], row[3], row[4], "savings_account")
+        first_row = next(reader) #check top row
+        column_map = {}
+        is_header = False
+        try:
+            datetime.strptime(first_row[0].strip(), "%Y-%m-%d")
+        except ValueError:
+            try:
+                datetime.strptime(first_row[0].strip(), "%m-%d-%Y")
+            except ValueError:
+                is_header = True
 
-                if "TFR-FR" in transaction.transaction_desc.upper() or "TFR.TO" in transaction.transaction_desc.upper():
-                    continue
-                elif "ws investments" in transaction.transaction_desc.lower():
-                    transaction.account_type = "ws_investments"
-                    bst.insert(transaction)
+        if is_header:
+            i = 0
+            for i in range(len(first_row)):
+                cell = first_row[i].strip().lower()
+                if "date" in cell:
+                    column_map["date"] = i
+                elif "transaction" in cell or "description" in cell:
+                    column_map["transaction_desc"] = i
+                elif "amount" in cell:
+                    column_map["amount"] = i
+                elif "balance" in cell:
+                    column_map["balance"] = i
+        else: # Assume TD CSV format (no header row)
+            column_map = {'date': 0, 'transaction_desc': 1, 'withdrawal': 2, 'deposit': 3, 'balance': 4}
+            # Immediately process the first row as a transaction given no header
+            first_transaction = Transaction(
+                first_row[column_map['date']],
+                first_row[column_map['transaction_desc']],
+                first_row[column_map['withdrawal']],
+                first_row[column_map['deposit']],
+                first_row[column_map['balance']],
+                current_file
+            )
+
+            if not ("TFR-FR" in first_transaction.transaction_desc.upper() or "TFR-TO" in first_transaction.transaction_desc.upper()):
+                if "ws investments" in first_transaction.transaction_desc.lower():
+                    first_transaction.account_type = "ws_investments"
+                bst.insert(first_transaction)
+
+        # The rest of the file gets processed in the loop below.
+        for row in reader:
+            if row is  None or len(row) < 4:
+                continue # Skip empty or insufficient rows
+            withdraw_amt = ""
+            deposit_amt = ""
+            if "amount" in column_map:
+                amount = row[column_map["amount"]].strip()
+                if amount.startswith('-'):
+                    withdraw_amt = amount[1:]  # Remove the negative
                 else:
-                    bst.insert(transaction)
+                    deposit_amt = amount
+            else:
+                withdraw_amt = row[column_map["withdrawal"]]
+                deposit_amt = row[column_map["deposit"]]
+
+            # Instantiation
+            transaction = Transaction(
+                row[column_map['date']],
+                row[column_map['transaction_desc']],
+                withdraw_amt,
+                deposit_amt,
+                row[column_map['balance']],
+                current_file
+            )
+            if "TFR-FR" in transaction.transaction_desc.upper() or "TFR-TO" in transaction.transaction_desc.upper():
+                continue
+            elif "ws investments" in transaction.transaction_desc.lower():
+                transaction.account_type = "ws_investments"
+                bst.insert(transaction)
+            else:
+                bst.insert(transaction)
 
 # Testing
 def in_order_print(node):

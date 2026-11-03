@@ -178,6 +178,66 @@ def in_order_print(node):
         in_order_print(node.right)
 
 in_order_print(bst.root)
-print(f"Total Income: {processor.total_income}")
-print(f"Total Spending: {processor.total_spending}")
-print(f"Total WS Investments: {processor.total_ws_investments}")
+
+
+# Frontend:
+
+from fastapi import FastAPI # Framework for building APIs
+from fastapi.middleware.cors import CORSMiddleware # Allows frontend to acccess backend information
+from fastapi.responses import HTMLResponse # Allows backend to send HTML responses to frontend
+import uvicorn # Server for running FastAPI applications
+
+app = FastAPI() # Initialize FastAPI app
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allow any local frontend to request data from backend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Endpoint 1: JSON API route for financial metrics
+@app.get("/api/metrics") # Tells app object to look for get requests.
+def get_financial_metrics():
+    liquid_cash = sum(processor.latest_balances.values()) # Calculate total liquid cash across all accounts
+
+# Serialize dictionary to JSON format for frontend.
+
+    return {
+        "total_income": processor.total_income,
+        "total_spending": processor.total_spending,
+        "total_ws_investments": processor.total_ws_investments,
+        "latest_balances": processor.latest_balances,
+        "liquid_cash": liquid_cash
+    }
+
+# Endpoint 2: Visual dashboard route using python's built-in HTMLResponse
+@app.get("/dashboard", response_class=HTMLResponse) # Route for the dashboard page
+def get_dashboard():
+    liquid_cash = sum(processor.latest_balances.values()) # Calculate total liquid cash across all accounts
+
+    # HTML content for the dashboard page
+    html_content = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>Wealth Management Engine</h2>
+            
+            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; width: 300px;">
+                <p><strong>Total Income:</strong> ${processor.total_income:,.2f}</p>
+                <p><strong>Total Spending:</strong> ${processor.total_spending:,.2f}</p>
+                <p><strong>Total Invested (WS):</strong> ${processor.total_ws_investments:,.2f}</p>
+                <hr>
+                <p><strong>Liquid Cash:</strong> ${liquid_cash:,.2f}</p>
+            </div>
+        </body>
+    </html>
+    """
+    return html_content
+
+
+    
+
+
+# Run the FastAPI server
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000) # Run the FastAPI server on localhost at port 8000

@@ -9,11 +9,11 @@ class Transaction:
     def __init__(self, date, transaction_desc, withdrawal, deposit, balance, account_type):
 
         date = date.strip()
+        # Handle different date formats (YYYY-MM-DD and MM-DD-YYYY)
         try:
             self.date = datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
             self.date = datetime.strptime(date, "%m-%d-%Y")
-
 
         self.transaction_desc = transaction_desc.strip()
         self.withdrawal = float(withdrawal.strip().replace(',','')) if withdrawal.strip() else 0.0
@@ -21,7 +21,7 @@ class Transaction:
         self.balance = float(balance.strip().replace(',','')) if balance.strip() else 0.0
         self.account_type = account_type
 
-# Node class for the binary search tree
+# Node class for the BST
 class Node:
     def __init__(self, transaction):
         self.transaction = transaction
@@ -38,7 +38,7 @@ class BST:
             self.root = Node(transaction)
         else:
             self._insert_recursive(self.root, transaction)
-
+    # Recursive helper to insert based on transaction date
     def _insert_recursive(self, node, transaction):
         if transaction.date < node.transaction.date:
             if node.left is None:
@@ -51,9 +51,10 @@ class BST:
             else:
                 self._insert_recursive(node.right, transaction)
 
-bst = BST()
-script_dir = os.path.dirname(os.path.abspath(__file__))
-# TODO: Implement csv.DictReader to handle misaligned columns across WS and TD schemas
+bst = BST() # Initialize the BST to hold transactions
+script_dir = os.path.dirname(os.path.abspath(__file__)) # Get directory of current script
+
+# Read and process CSV files
 csv_files = ["td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv"]
 for filename in csv_files:
     file_path = os.path.join(script_dir, filename)
@@ -63,20 +64,20 @@ for filename in csv_files:
     with open(file_path, mode = 'r', encoding='utf-8') as csvfile:
         reader = csv.reader(csvfile)
 
-        first_row = next(reader, None) #check top row
+        first_row = next(reader, None) # Check top row for header or not (TD CSV format has no header)
         if not first_row:
             continue # Skip empty
-        column_map = {}
-        is_header = False
+        column_map = {} # Map column names to dictionary keys for indexing
+        is_header = False # Assume no header until proven otherwise
         try:
             datetime.strptime(first_row[0].strip(), "%Y-%m-%d")
-        except ValueError:
+        except ValueError: # Check multiple date formats 
             try:
                 datetime.strptime(first_row[0].strip(), "%m-%d-%Y")
             except ValueError:
-                is_header = True
+                is_header = True # If the first column isn't a date, assume it's a header row
 
-        if is_header:
+        if is_header: # If the first row is a header, map columns based on name.
             i = 0
             for i in range(len(first_row)):
                 cell = first_row[i].strip().lower()
@@ -99,7 +100,7 @@ for filename in csv_files:
                 first_row[column_map['balance']],
                 current_file
             )
-
+            # Determine account type for the first transaction and insert into BST
             if not ("TFR-FR" in first_transaction.transaction_desc.upper() or "TFR-TO" in first_transaction.transaction_desc.upper()):
                 if "ws investments" in first_transaction.transaction_desc.lower():
                     first_transaction.account_type = "ws_investments"
@@ -156,7 +157,7 @@ class FinancialTotals:
                 self.latest_balances[transac.account_type] = transac.balance # Update the latest balance for the account type
 
 
-            if transac.account_type == "ws_investments":
+            if transac.account_type == "ws_investments": # Track investments but do not count them as income or spending.
                 self.total_ws_investments += transac.withdrawal #Money isn't leaving TFSA ever.
 
             elif transac.account_type != "internal_transfer": #TFR-FR and TFR-TO are internal transfers, so we don't count them as income or spending.

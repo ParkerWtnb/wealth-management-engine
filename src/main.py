@@ -1,12 +1,17 @@
 import csv
+import html
 import io
 import itertools
+import logging
+import math
 import os
 from datetime import datetime
 
-from fastapi import FastAPI, File, HTTPException, UploadFile # Framework for building APIs
+from fastapi import FastAPI, File, UploadFile # Framework for building APIs
 from fastapi.responses import HTMLResponse # Allows backend to send HTML responses to frontend
 import uvicorn # Server for running FastAPI applications
+
+logger = logging.getLogger("wealth_engine") # Never log row contents or filenames: statements are private
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) # Directory of this script
 SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv")
@@ -15,67 +20,120 @@ DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y")
 TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT") # Substrings in a description that mean an internal transfer
 TRANSFER_TYPES = {"EFT", "EFTOUT"} # Wealthsimple transaction types for moves to/from a linked bank account
 
+# Schema for headerless TD exports: date, description, withdrawal, deposit, balance
+TD_COLUMNS = {'date': 0, 'transaction_desc': 1, 'withdrawal': 2, 'deposit': 3, 'balance': 4}
+# Columns a file with a header row (e.g. Wealthsimple) must have, with user-facing names
+REQUIRED_HEADER_COLUMNS = {"date": "date", "transaction_desc": "description", "amount": "amount", "balance": "balance"}
+
+
+class StatementFormatError(Exception):
+    """A file that doesn't look like a supported bank statement.
+    Messages may name the file and row number but must never include cell values."""
+
+
+def _parse_date(cell):
+    # Handle different date formats (YYYY-MM-DD and MM-DD-YYYY)
+    cell = cell.strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(cell, fmt)
+        except ValueError:
+            pass
+    raise ValueError("unrecognized date") # Deliberately no cell value in the message
+
+
+def _parse_amount(cell):
+    cell = cell.strip().replace(',', '')
+    if not cell:
+        return 0.0
+    value = float(cell) # May raise ValueError; callers re-raise without the original message
+    if not math.isfinite(value): # float() happily accepts "nan" and "inf"
+        raise ValueError("non-finite amount")
+    return value
+
+
+def _is_date(cell):
+    try:
+        _parse_date(cell)
+        return True
+    except ValueError:
+        return False
+
+
 # Transaction class to hold transaction data and transform CSV data.
 class Transaction:
     def __init__(self, date, transaction_desc, withdrawal, deposit, balance, account_type):
-
-        date = date.strip()
-        # Handle different date formats (YYYY-MM-DD and MM-DD-YYYY)
-        try:
-            self.date = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            self.date = datetime.strptime(date, "%m-%d-%Y")
-
+        self.date = _parse_date(date)
         self.transaction_desc = transaction_desc.strip()
-        self.withdrawal = float(withdrawal.strip().replace(',','')) if withdrawal.strip() else 0.0
-        self.deposit = float(deposit.strip().replace(',','')) if deposit.strip() else 0.0
-        self.balance = float(balance.strip().replace(',','')) if balance.strip() else 0.0
+        self.withdrawal = _parse_amount(withdrawal)
+        self.deposit = _parse_amount(deposit)
+        self.balance = _parse_amount(balance)
         self.account = account_type # Source account (from the filename); never changes
         self.account_type = account_type # Classification; may become internal_transfer / ws_investments
 
 
-def _is_date(cell):
-    for fmt in DATE_FORMATS:
-        try:
-            datetime.strptime(cell.strip(), fmt)
-            return True
-        except ValueError:
-            pass
-    return False
+def _map_header(header):
+    """Map a header row to column indexes, or raise StatementFormatError if required columns are missing."""
+    column_map = {}
+    for i, cell in enumerate(header):
+        cell = cell.strip().lower()
+        if "date" in cell:
+            column_map["date"] = i
+        elif "description" in cell:
+            column_map["transaction_desc"] = i
+        elif "transaction" in cell: # e.g. Wealthsimple's "transaction" column holds EFT / EFTOUT / SPEND
+            column_map["transaction_type"] = i
+        elif "amount" in cell:
+            column_map["amount"] = i
+        elif "balance" in cell:
+            column_map["balance"] = i
+
+    if "transaction_desc" not in column_map and "transaction_type" in column_map:
+        column_map["transaction_desc"] = column_map["transaction_type"] # Only a "transaction" column: use it as the description
+
+    missing = [label for key, label in REQUIRED_HEADER_COLUMNS.items() if key not in column_map]
+    if missing:
+        raise StatementFormatError(f"the header row is missing these columns: {', '.join(missing)}")
+    return column_map
 
 
 def parse_csv(filename, text):
-    """Parse one CSV statement into a list of Transactions. Uses only local state."""
+    """Parse one CSV statement into a list of Transactions. Uses only local state.
+    Raises StatementFormatError (with a value-free message) if the file isn't a supported statement."""
+    try:
+        return _parse_rows(filename, text)
+    except StatementFormatError as exc:
+        raise StatementFormatError(f"{os.path.basename(filename)}: {exc}") from None
+    except csv.Error:
+        raise StatementFormatError(f"{os.path.basename(filename)}: this isn't a readable CSV file") from None
+
+
+def _parse_rows(filename, text):
     account = os.path.splitext(os.path.basename(filename))[0]
     reader = csv.reader(io.StringIO(text))
 
     first_row = next(reader, None) # Check top row for header or not (TD CSV format has no header)
-    if not first_row:
-        return []
+    while first_row is not None and not any(cell.strip() for cell in first_row):
+        first_row = next(reader, None) # Skip leading blank lines
+    if first_row is None:
+        raise StatementFormatError("the file is empty")
 
     if _is_date(first_row[0]): # Assume TD CSV format (no header row)
-        column_map = {'date': 0, 'transaction_desc': 1, 'withdrawal': 2, 'deposit': 3, 'balance': 4}
+        column_map = TD_COLUMNS
         rows = itertools.chain([first_row], reader) # First row is data, so process it like every other row
     else: # If the first row is a header, map columns based on name.
-        column_map = {}
-        for i, cell in enumerate(first_row):
-            cell = cell.strip().lower()
-            if "date" in cell:
-                column_map["date"] = i
-            elif "description" in cell:
-                column_map["transaction_desc"] = i
-            elif "transaction" in cell: # e.g. Wealthsimple's "transaction" column holds EFT / EFTOUT / SPEND
-                column_map["transaction_type"] = i
-            elif "amount" in cell:
-                column_map["amount"] = i
-            elif "balance" in cell:
-                column_map["balance"] = i
+        column_map = _map_header(first_row)
         rows = reader
+    min_width = max(column_map.values()) + 1
 
     transactions = []
     for row in rows:
-        if not row or len(row) < 4:
-            continue # Skip empty or insufficient rows
+        if not any(cell.strip() for cell in row):
+            continue # Skip blank lines
+        line = reader.line_num
+        if len(row) < min_width:
+            raise StatementFormatError(f"row {line} has {len(row)} columns but at least {min_width} are expected")
+
         withdraw_amt = ""
         deposit_amt = ""
         if "amount" in column_map:
@@ -88,15 +146,18 @@ def parse_csv(filename, text):
             withdraw_amt = row[column_map["withdrawal"]]
             deposit_amt = row[column_map["deposit"]]
 
-        # Instantiation
-        transaction = Transaction(
-            row[column_map['date']],
-            row[column_map['transaction_desc']],
-            withdraw_amt,
-            deposit_amt,
-            row[column_map['balance']],
-            account
-        )
+        # Instantiation; `from None` drops the ValueError, whose message would contain the raw cell value
+        try:
+            transaction = Transaction(
+                row[column_map['date']],
+                row[column_map['transaction_desc']],
+                withdraw_amt,
+                deposit_amt,
+                row[column_map['balance']],
+                account
+            )
+        except ValueError:
+            raise StatementFormatError(f"row {line} has a date or amount that couldn't be read") from None
 
         # Classify using the description plus the transaction-type column when the file has one
         desc_upper = transaction.transaction_desc.upper()
@@ -108,6 +169,8 @@ def parse_csv(filename, text):
             transaction.account_type = "ws_investments"
         transactions.append(transaction)
 
+    if not transactions:
+        raise StatementFormatError("no transactions were found")
     return transactions
 
 
@@ -165,8 +228,15 @@ UPLOAD_FORM = """
 """
 
 
-def render_dashboard(totals=None):
-    if totals is None:
+def render_dashboard(totals=None, error=None):
+    if error is not None:
+        results = f"""
+            <div style="background-color: #fdecea; color: #611a15; padding: 15px; border-radius: 8px; max-width: 480px;">
+                <p><strong>That doesn't look like a bank statement we can read.</strong></p>
+                <p>{html.escape(error)}</p>
+                <p>Please upload the CSV export from TD or Wealthsimple without editing it.</p>
+            </div>"""
+    elif totals is None:
         results = "<p>Upload one or more CSV statements to see your totals.</p>"
     else:
         results = f"""
@@ -200,14 +270,28 @@ def get_dashboard():
 async def upload_statements(files: list[UploadFile] = File(...)):
     decoded = []
     for upload in files:
+        name = os.path.basename(upload.filename or "upload.csv")
         raw = await upload.read(MAX_FILE_BYTES + 1)
         if len(raw) > MAX_FILE_BYTES:
-            raise HTTPException(status_code=413, detail="Each file must be 2 MB or smaller.")
+            return _error_response(f"{name}: each file must be 2 MB or smaller", 413)
         try:
-            decoded.append((upload.filename or "upload.csv", raw.decode("utf-8-sig")))
+            decoded.append((name, raw.decode("utf-8-sig")))
         except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="Files must be UTF-8 CSV exports.") from None
-    return render_dashboard(build_report(decoded))
+            return _error_response(f"{name}: this isn't a UTF-8 text CSV file", 400)
+
+    try:
+        totals = build_report(decoded)
+    except StatementFormatError as exc:
+        return _error_response(str(exc), 400)
+    except Exception as exc: # Unexpected bug: log only the exception type so no statement data reaches the logs
+        logger.error("upload processing failed (%s)", type(exc).__name__)
+        return _error_response("something went wrong while reading your files", 500)
+    return render_dashboard(totals)
+
+
+def _error_response(message, status_code):
+    logger.info("upload rejected (HTTP %d)", status_code) # No filename or message: both can carry personal data
+    return HTMLResponse(render_dashboard(error=message), status_code=status_code)
 
 
 # Sample route: run the bundled anonymized CSVs through the same pipeline

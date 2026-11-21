@@ -221,7 +221,7 @@ def get_dashboard():
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
             <h2>Wealth Management Engine</h2>
-            
+             
             <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; width: 300px;">
                 <p><strong>Total Income:</strong> ${processor.total_income:,.2f}</p>
                 <p><strong>Total Spending:</strong> ${processor.total_spending:,.2f}</p>

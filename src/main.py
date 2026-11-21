@@ -12,7 +12,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) # Directory of this scri
 SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv")
 MAX_FILE_BYTES = 2 * 1024 * 1024 # 2 MB per uploaded CSV
 DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y")
-TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT")
+TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT") # Substrings in a description that mean an internal transfer
+TRANSFER_TYPES = {"EFT", "EFTOUT"} # Wealthsimple transaction types for moves to/from a linked bank account
 
 # Transaction class to hold transaction data and transform CSV data.
 class Transaction:
@@ -29,37 +30,8 @@ class Transaction:
         self.withdrawal = float(withdrawal.strip().replace(',','')) if withdrawal.strip() else 0.0
         self.deposit = float(deposit.strip().replace(',','')) if deposit.strip() else 0.0
         self.balance = float(balance.strip().replace(',','')) if balance.strip() else 0.0
-        self.account_type = account_type
-
-# Node class for the BST
-class Node:
-    def __init__(self, transaction):
-        self.transaction = transaction
-        self.left = None
-        self.right = None
-
-# Binary Search Tree class to hold transactions in order (chronologically)
-class BST:
-    def __init__(self):
-        self.root = None
-
-    def insert(self, transaction):
-        if self.root is None:
-            self.root = Node(transaction)
-        else:
-            self._insert_recursive(self.root, transaction)
-    # Recursive helper to insert based on transaction date
-    def _insert_recursive(self, node, transaction):
-        if transaction.date < node.transaction.date:
-            if node.left is None:
-                node.left = Node(transaction)
-            elif node.left is not None:
-                self._insert_recursive(node.left, transaction)
-        else:
-            if node.right is None:
-                node.right = Node(transaction)
-            else:
-                self._insert_recursive(node.right, transaction)
+        self.account = account_type # Source account (from the filename); never changes
+        self.account_type = account_type # Classification; may become internal_transfer / ws_investments
 
 
 def _is_date(cell):
@@ -127,13 +99,12 @@ def parse_csv(filename, text):
         )
 
         # Classify using the description plus the transaction-type column when the file has one
-        labels = transaction.transaction_desc.upper()
-        if "transaction_type" in column_map:
-            labels += " " + row[column_map["transaction_type"]].strip().upper()
+        desc_upper = transaction.transaction_desc.upper()
+        txn_type = row[column_map["transaction_type"]].strip().upper() if "transaction_type" in column_map else ""
 
-        if any(marker in labels for marker in TRANSFER_MARKERS):
+        if txn_type in TRANSFER_TYPES or any(marker in desc_upper for marker in TRANSFER_MARKERS):
             transaction.account_type = "internal_transfer"
-        elif "WS INVESTMENTS" in labels:
+        elif "WS INVESTMENTS" in desc_upper:
             transaction.account_type = "ws_investments"
         transactions.append(transaction)
 
@@ -151,33 +122,31 @@ class FinancialTotals:
     def liquid_cash(self):
         return sum(self.latest_balances.values()) # Total liquid cash across all accounts
 
-    def transaction_processor(self, node):
-        if node is not None:
-            self.transaction_processor(node.left) #Left first (oldest transactions)
-            transac = node.transaction
-            if transac.account_type not in ["internal_transfer", "ws_investments"]: # Regular transactions
-                self.latest_balances[transac.account_type] = transac.balance # Update the latest balance for the account type
-
+    def transaction_processor(self, transactions):
+        """transactions must already be sorted oldest -> newest."""
+        for transac in transactions:
+            # Every row carries the account's running balance, transfers included, so the last one seen is the ending balance
+            self.latest_balances[transac.account] = transac.balance
 
             if transac.account_type == "ws_investments": # Track investments but do not count them as income or spending.
                 self.total_ws_investments += transac.withdrawal #Money isn't leaving TFSA ever.
 
-            elif transac.account_type != "internal_transfer": #TFR-FR and TFR-TO are internal transfers, so we don't count them as income or spending.
+            elif transac.account_type != "internal_transfer": #Internal transfers aren't income or spending.
                 self.total_income += transac.deposit
                 self.total_spending += transac.withdrawal
-
-            self.transaction_processor(node.right) #Right last (newer transactions)
 
 
 def build_report(files):
     """files: iterable of (filename, csv_text). Everything lives in this call; nothing is shared between requests."""
-    bst = BST()
+    transactions = []
     for filename, text in files:
-        for transaction in parse_csv(filename, text):
-            bst.insert(transaction)
+        transactions.extend(parse_csv(filename, text))
+
+    # Timsort is stable, so same-day rows keep their file order and the last balance of the day wins
+    transactions.sort(key=lambda t: t.date)
 
     totals = FinancialTotals()
-    totals.transaction_processor(bst.root)
+    totals.transaction_processor(transactions)
     return totals
 
 

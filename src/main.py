@@ -9,14 +9,16 @@ from collections import Counter
 from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile # Framework for building APIs
-from fastapi.responses import HTMLResponse # Allows backend to send HTML responses to frontend
+from fastapi.responses import HTMLResponse, RedirectResponse # HTML pages and the / -> /dashboard redirect
 import uvicorn # Server for running FastAPI applications
 
 logger = logging.getLogger("wealth_engine") # Never log row contents or filenames: statements are private
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) # Directory of this script
 SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv")
-MAX_FILE_BYTES = 2 * 1024 * 1024 # 2 MB per uploaded CSV
+# 1 MB per uploaded CSV. Must stay below Starlette's 1 MiB (1,048,576-byte) SpooledTemporaryFile threshold so
+# every file we accept is held in memory and never spooled to disk (backs the privacy notice).
+MAX_FILE_BYTES = 1_000_000
 DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y")
 TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT") # Substrings in a description that mean an internal transfer
 TRANSFER_TYPES = {"EFT", "EFTOUT"} # Wealthsimple transaction types for moves to/from a linked bank account
@@ -265,20 +267,43 @@ UPLOAD_FORM = """
                 <input type="file" name="files" accept=".csv" multiple required>
                 <button type="submit">Upload statements</button>
             </form>
+            <p style="color: #555; font-size: 0.9em; max-width: 480px;">Tip: upload one export per account, or overlapping date ranges if combining multiple files for the same account.</p>
             <form action="/sample" method="post">
                 <button type="submit">Try with sample data</button>
             </form>
 """
 
+PRIVACY_NOTICE = """
+            <p style="color: #555; font-size: 0.85em; max-width: 480px; margin-top: 24px;">
+                Privacy: your files are processed strictly in memory for this request only.<br>
+                They are never stored or logged.
+            </p>
+            <p style="color: #555; font-size: 0.85em;">Tested on TD and Wealthsimple CSV exports.</p>
+"""
 
-def render_dashboard(totals=None, error=None):
-    if error is not None:
-        results = f"""
+# status code -> (heading, follow-up hint); 5xx errors are our fault, so never blame the user's file
+ERROR_TEXT = {
+    400: ("That doesn't look like a bank statement we can read.",
+          "Please upload the CSV export from TD or Wealthsimple without editing it."),
+    413: ("That file is too large.", "Each statement must be 1 MB or smaller."),
+    500: ("Something went wrong on our end.", "Your files weren't saved. Please try again in a moment."),
+}
+
+
+def _render_error(message, status_code):
+    heading, hint = ERROR_TEXT.get(status_code) or ERROR_TEXT[500 if status_code >= 500 else 400]
+    hint = f"<p>{hint}</p>"
+    return f"""
             <div style="background-color: #fdecea; color: #611a15; padding: 15px; border-radius: 8px; max-width: 480px;">
-                <p><strong>That doesn't look like a bank statement we can read.</strong></p>
-                <p>{html.escape(error)}</p>
-                <p>Please upload the CSV export from TD or Wealthsimple without editing it.</p>
+                <p><strong>{heading}</strong></p>
+                <p>{html.escape(message)}</p>
+                {hint}
             </div>"""
+
+
+def render_dashboard(totals=None, error=None, status_code=400):
+    if error is not None:
+        results = _render_error(error, status_code)
     elif totals is None:
         results = "<p>Upload one or more CSV statements to see your totals.</p>"
     else:
@@ -286,7 +311,8 @@ def render_dashboard(totals=None, error=None):
             <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; width: 300px;">
                 <p><strong>Total Income:</strong> ${totals.total_income:,.2f}</p>
                 <p><strong>Total Spending:</strong> ${totals.total_spending:,.2f}</p>
-                <p><strong>Total Invested (WS):</strong> ${totals.total_ws_investments:,.2f}</p>
+                <p style="margin-bottom: 2px;"><strong>Sent to Wealthsimple:</strong> ${totals.total_ws_investments:,.2f}</p>
+                <p style="margin-top: 0; color: #555; font-size: 0.8em;">TD labels all Wealthsimple transfers as "WS Investments", so this may include money moved to a spending account.</p>
                 <hr>
                 <p><strong>Liquid Cash:</strong> ${totals.liquid_cash:,.2f}</p>
             </div>"""
@@ -297,9 +323,16 @@ def render_dashboard(totals=None, error=None):
             <h2>Wealth Management Engine</h2>
             {UPLOAD_FORM}
             {results}
+            {PRIVACY_NOTICE}
         </body>
     </html>
     """
+
+
+# Root just forwards to the dashboard
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/dashboard", status_code=307)
 
 
 # Visual dashboard route: empty state with the upload form
@@ -316,7 +349,7 @@ async def upload_statements(files: list[UploadFile] = File(...)):
         name = os.path.basename(upload.filename or "upload.csv")
         raw = await upload.read(MAX_FILE_BYTES + 1)
         if len(raw) > MAX_FILE_BYTES:
-            return _error_response(f"{name}: each file must be 2 MB or smaller", 413)
+            return _error_response(f"{name} is over the size limit", 413)
         try:
             decoded.append((name, raw.decode("utf-8-sig")))
         except UnicodeDecodeError:
@@ -328,13 +361,13 @@ async def upload_statements(files: list[UploadFile] = File(...)):
         return _error_response(str(exc), 400)
     except Exception as exc: # Unexpected bug: log only the exception type so no statement data reaches the logs
         logger.error("upload processing failed (%s)", type(exc).__name__)
-        return _error_response("something went wrong while reading your files", 500)
+        return _error_response("We hit an unexpected error while processing your upload.", 500)
     return render_dashboard(totals)
 
 
 def _error_response(message, status_code):
     logger.info("upload rejected (HTTP %d)", status_code) # No filename or message: both can carry personal data
-    return HTMLResponse(render_dashboard(error=message), status_code=status_code)
+    return HTMLResponse(render_dashboard(error=message, status_code=status_code), status_code=status_code)
 
 
 # Sample route: run the bundled anonymized CSVs through the same pipeline

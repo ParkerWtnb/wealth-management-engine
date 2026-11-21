@@ -5,6 +5,7 @@ import itertools
 import logging
 import math
 import os
+from collections import Counter
 from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile # Framework for building APIs
@@ -199,11 +200,53 @@ class FinancialTotals:
                 self.total_spending += transac.withdrawal
 
 
+def _dedup_key(t):
+    """Identity of a transaction across overlapping exports. The running balance keeps same-day
+    identical purchases distinct; the filename is deliberately not part of the key."""
+    description = " ".join(t.transaction_desc.split()).upper() # Ignore spacing/case differences between exports
+    amount = round(t.deposit - t.withdrawal, 2)
+    return (t.date, description, amount, round(t.balance, 2))
+
+
+def deduplicate(parsed_files):
+    """parsed_files: list of transaction lists, one per file.
+    A key that appears n times in one file is a real repeat, so keep n copies; across files keep the
+    max count, taken from the single file that had the most, so overlapping exports count once."""
+    best_count = Counter() # key -> highest count seen in any one file
+    owner = {} # key -> index of the file whose copies we keep
+    first_file = {} # key -> first file it appeared in, used to spot overlapping exports
+    group = list(range(len(parsed_files))) # Union-find: files that share a transaction are the same account
+
+    def find(i):
+        while group[i] != i:
+            group[i] = group[group[i]]
+            i = group[i]
+        return i
+
+    for i, transactions in enumerate(parsed_files):
+        for key, n in Counter(map(_dedup_key, transactions)).items():
+            if n > best_count[key]:
+                best_count[key] = n
+                owner[key] = i
+            j = first_file.setdefault(key, i)
+            if j != i:
+                group[find(i)] = find(j) # Overlap => same account, even if the filenames differ
+
+    kept = []
+    for i, transactions in enumerate(parsed_files):
+        root = find(i)
+        canonical = parsed_files[root][0].account if parsed_files[root] else None
+        for t in transactions:
+            if owner[_dedup_key(t)] == i:
+                t.account = canonical or t.account # One ending balance per real account, not per file
+                kept.append(t)
+    return kept
+
+
 def build_report(files):
     """files: iterable of (filename, csv_text). Everything lives in this call; nothing is shared between requests."""
-    transactions = []
-    for filename, text in files:
-        transactions.extend(parse_csv(filename, text))
+    parsed_files = [parse_csv(filename, text) for filename, text in files]
+    transactions = deduplicate(parsed_files)
 
     # Timsort is stable, so same-day rows keep their file order and the last balance of the day wins
     transactions.sort(key=lambda t: t.date)

@@ -1,8 +1,18 @@
 import csv
-# import JSON
+import io
+import itertools
 import os
-from datetime import date, datetime
-from platform import node
+from datetime import datetime
+
+from fastapi import FastAPI, File, HTTPException, UploadFile # Framework for building APIs
+from fastapi.responses import HTMLResponse # Allows backend to send HTML responses to frontend
+import uvicorn # Server for running FastAPI applications
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) # Directory of this script
+SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv")
+MAX_FILE_BYTES = 2 * 1024 * 1024 # 2 MB per uploaded CSV
+DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y")
+TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT")
 
 # Transaction class to hold transaction data and transform CSV data.
 class Transaction:
@@ -51,95 +61,83 @@ class BST:
             else:
                 self._insert_recursive(node.right, transaction)
 
-bst = BST() # Initialize the BST to hold transactions
-script_dir = os.path.dirname(os.path.abspath(__file__)) # Get directory of current script
 
-# Read and process CSV files
-csv_files = ["td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_card.csv"]
-for filename in csv_files:
-    file_path = os.path.join(script_dir, filename)
-
-    current_file = filename.replace(".csv", "")
-
-    with open(file_path, mode = 'r', encoding='utf-8') as csvfile:
-        reader = csv.reader(csvfile)
-
-        first_row = next(reader, None) # Check top row for header or not (TD CSV format has no header)
-        if not first_row:
-            continue # Skip empty
-        column_map = {} # Map column names to dictionary keys for indexing
-        is_header = False # Assume no header until proven otherwise
+def _is_date(cell):
+    for fmt in DATE_FORMATS:
         try:
-            datetime.strptime(first_row[0].strip(), "%Y-%m-%d")
-        except ValueError: # Check multiple date formats 
-            try:
-                datetime.strptime(first_row[0].strip(), "%m-%d-%Y")
-            except ValueError:
-                is_header = True # If the first column isn't a date, assume it's a header row
+            datetime.strptime(cell.strip(), fmt)
+            return True
+        except ValueError:
+            pass
+    return False
 
-        if is_header: # If the first row is a header, map columns based on name.
-            i = 0
-            for i in range(len(first_row)):
-                cell = first_row[i].strip().lower()
-                if "date" in cell:
-                    column_map["date"] = i
-                elif "transaction" in cell or "description" in cell:
-                    column_map["transaction_desc"] = i
-                elif "amount" in cell:
-                    column_map["amount"] = i
-                elif "balance" in cell:
-                    column_map["balance"] = i
-        else: # Assume TD CSV format (no header row)
-            column_map = {'date': 0, 'transaction_desc': 1, 'withdrawal': 2, 'deposit': 3, 'balance': 4}
-            # Immediately process the first row as a transaction given no header
-            first_transaction = Transaction(
-                first_row[column_map['date']],
-                first_row[column_map['transaction_desc']],
-                first_row[column_map['withdrawal']],
-                first_row[column_map['deposit']],
-                first_row[column_map['balance']],
-                current_file
-            )
-            # Determine account type for the first transaction and insert into BST
-            if not ("TFR-FR" in first_transaction.transaction_desc.upper() or "TFR-TO" in first_transaction.transaction_desc.upper()):
-                if "ws investments" in first_transaction.transaction_desc.lower():
-                    first_transaction.account_type = "ws_investments"
-                bst.insert(first_transaction)
 
-        # The rest of the file gets processed in the loop below.
-        for row in reader:
-            if not row or len(row) < 4:
-                continue # Skip empty or insufficient rows
-            withdraw_amt = ""
-            deposit_amt = ""
-            if "amount" in column_map:
-                amount = row[column_map["amount"]].strip()
-                if amount.startswith('-'):
-                    withdraw_amt = amount[1:]  # Remove the negative
-                else:
-                    deposit_amt = amount
+def parse_csv(filename, text):
+    """Parse one CSV statement into a list of Transactions. Uses only local state."""
+    account = os.path.splitext(os.path.basename(filename))[0]
+    reader = csv.reader(io.StringIO(text))
+
+    first_row = next(reader, None) # Check top row for header or not (TD CSV format has no header)
+    if not first_row:
+        return []
+
+    if _is_date(first_row[0]): # Assume TD CSV format (no header row)
+        column_map = {'date': 0, 'transaction_desc': 1, 'withdrawal': 2, 'deposit': 3, 'balance': 4}
+        rows = itertools.chain([first_row], reader) # First row is data, so process it like every other row
+    else: # If the first row is a header, map columns based on name.
+        column_map = {}
+        for i, cell in enumerate(first_row):
+            cell = cell.strip().lower()
+            if "date" in cell:
+                column_map["date"] = i
+            elif "description" in cell:
+                column_map["transaction_desc"] = i
+            elif "transaction" in cell: # e.g. Wealthsimple's "transaction" column holds EFT / EFTOUT / SPEND
+                column_map["transaction_type"] = i
+            elif "amount" in cell:
+                column_map["amount"] = i
+            elif "balance" in cell:
+                column_map["balance"] = i
+        rows = reader
+
+    transactions = []
+    for row in rows:
+        if not row or len(row) < 4:
+            continue # Skip empty or insufficient rows
+        withdraw_amt = ""
+        deposit_amt = ""
+        if "amount" in column_map:
+            amount = row[column_map["amount"]].strip()
+            if amount.startswith('-'):
+                withdraw_amt = amount[1:]  # Remove the negative
             else:
-                withdraw_amt = row[column_map["withdrawal"]]
-                deposit_amt = row[column_map["deposit"]]
+                deposit_amt = amount
+        else:
+            withdraw_amt = row[column_map["withdrawal"]]
+            deposit_amt = row[column_map["deposit"]]
 
-            # Instantiation
-            transaction = Transaction(
-                row[column_map['date']],
-                row[column_map['transaction_desc']],
-                withdraw_amt,
-                deposit_amt,
-                row[column_map['balance']],
-                current_file
-            )
-            desc_upper = transaction.transaction_desc.upper()
-            if "TFR-FR" in desc_upper or "TFR-TO" in desc_upper or "EFTOUT" in desc_upper:
-                transaction.account_type = "internal_transfer"
-                bst.insert(transaction)
-            elif "ws investments" in transaction.transaction_desc.lower():
-                transaction.account_type = "ws_investments"
-                bst.insert(transaction)
-            else:
-                bst.insert(transaction)
+        # Instantiation
+        transaction = Transaction(
+            row[column_map['date']],
+            row[column_map['transaction_desc']],
+            withdraw_amt,
+            deposit_amt,
+            row[column_map['balance']],
+            account
+        )
+
+        # Classify using the description plus the transaction-type column when the file has one
+        labels = transaction.transaction_desc.upper()
+        if "transaction_type" in column_map:
+            labels += " " + row[column_map["transaction_type"]].strip().upper()
+
+        if any(marker in labels for marker in TRANSFER_MARKERS):
+            transaction.account_type = "internal_transfer"
+        elif "WS INVESTMENTS" in labels:
+            transaction.account_type = "ws_investments"
+        transactions.append(transaction)
+
+    return transactions
 
 
 class FinancialTotals:
@@ -148,6 +146,10 @@ class FinancialTotals:
         self.total_spending = 0.0
         self.total_ws_investments = 0.0
         self.latest_balances = {}
+
+    @property
+    def liquid_cash(self):
+        return sum(self.latest_balances.values()) # Total liquid cash across all accounts
 
     def transaction_processor(self, node):
         if node is not None:
@@ -166,76 +168,87 @@ class FinancialTotals:
 
             self.transaction_processor(node.right) #Right last (newer transactions)
 
-processor = FinancialTotals()
-processor.transaction_processor(bst.root)
 
+def build_report(files):
+    """files: iterable of (filename, csv_text). Everything lives in this call; nothing is shared between requests."""
+    bst = BST()
+    for filename, text in files:
+        for transaction in parse_csv(filename, text):
+            bst.insert(transaction)
 
-# Testing (temporary pre frontend implementation)
-def in_order_print(node):
-    if node is not None:
-        in_order_print(node.left)
-        print(f"Date: {node.transaction.date}, Description: {node.transaction.transaction_desc}, Withdrawal: {node.transaction.withdrawal}, Deposit: {node.transaction.deposit}, Balance: {node.transaction.balance}, Account Type: {node.transaction.account_type}")
-        in_order_print(node.right)
-
-in_order_print(bst.root)
+    totals = FinancialTotals()
+    totals.transaction_processor(bst.root)
+    return totals
 
 
 # Frontend:
 
-from fastapi import FastAPI # Framework for building APIs
-from fastapi.middleware.cors import CORSMiddleware # Allows frontend to acccess backend information
-from fastapi.responses import HTMLResponse # Allows backend to send HTML responses to frontend
-import uvicorn # Server for running FastAPI applications
-
 app = FastAPI() # Initialize FastAPI app
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # Allow any local frontend to request data from backend
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# Endpoint 1: JSON API route for financial metrics
-@app.get("/api/metrics") # Tells app object to look for get requests.
-def get_financial_metrics():
-    liquid_cash = sum(processor.latest_balances.values()) # Calculate total liquid cash across all accounts
+UPLOAD_FORM = """
+            <form action="/upload" method="post" enctype="multipart/form-data">
+                <input type="file" name="files" accept=".csv" multiple required>
+                <button type="submit">Upload statements</button>
+            </form>
+            <form action="/sample" method="post">
+                <button type="submit">Try with sample data</button>
+            </form>
+"""
 
-# Serialize dictionary to JSON format for frontend.
 
-    return {
-        "total_income": processor.total_income,
-        "total_spending": processor.total_spending,
-        "total_ws_investments": processor.total_ws_investments,
-        "latest_balances": processor.latest_balances,
-        "liquid_cash": liquid_cash
-    }
+def render_dashboard(totals=None):
+    if totals is None:
+        results = "<p>Upload one or more CSV statements to see your totals.</p>"
+    else:
+        results = f"""
+            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; width: 300px;">
+                <p><strong>Total Income:</strong> ${totals.total_income:,.2f}</p>
+                <p><strong>Total Spending:</strong> ${totals.total_spending:,.2f}</p>
+                <p><strong>Total Invested (WS):</strong> ${totals.total_ws_investments:,.2f}</p>
+                <hr>
+                <p><strong>Liquid Cash:</strong> ${totals.liquid_cash:,.2f}</p>
+            </div>"""
 
-# Endpoint 2: Visual dashboard route using python's built-in HTMLResponse
-@app.get("/dashboard", response_class=HTMLResponse) # Route for the dashboard page
-def get_dashboard():
-    liquid_cash = sum(processor.latest_balances.values()) # Calculate total liquid cash across all accounts
-
-    # HTML content for the dashboard page
-    html_content = f"""
+    return f"""
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
             <h2>Wealth Management Engine</h2>
-             
-            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; width: 300px;">
-                <p><strong>Total Income:</strong> ${processor.total_income:,.2f}</p>
-                <p><strong>Total Spending:</strong> ${processor.total_spending:,.2f}</p>
-                <p><strong>Total Invested (WS):</strong> ${processor.total_ws_investments:,.2f}</p>
-                <hr>
-                <p><strong>Liquid Cash:</strong> ${liquid_cash:,.2f}</p>
-            </div>
+            {UPLOAD_FORM}
+            {results}
         </body>
     </html>
     """
-    return html_content
 
 
-    
+# Visual dashboard route: empty state with the upload form
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard():
+    return render_dashboard()
+
+
+# Upload route: parse the uploaded CSVs for this request only and return the dashboard
+@app.post("/upload", response_class=HTMLResponse)
+async def upload_statements(files: list[UploadFile] = File(...)):
+    decoded = []
+    for upload in files:
+        raw = await upload.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="Each file must be 2 MB or smaller.")
+        try:
+            decoded.append((upload.filename or "upload.csv", raw.decode("utf-8-sig")))
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="Files must be UTF-8 CSV exports.") from None
+    return render_dashboard(build_report(decoded))
+
+
+# Sample route: run the bundled anonymized CSVs through the same pipeline
+@app.post("/sample", response_class=HTMLResponse)
+def sample_statements():
+    files = []
+    for filename in SAMPLE_FILES:
+        with open(os.path.join(SCRIPT_DIR, filename), encoding="utf-8") as f:
+            files.append((filename, f.read()))
+    return render_dashboard(build_report(files))
 
 
 # Run the FastAPI server

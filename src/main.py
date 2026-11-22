@@ -19,7 +19,7 @@ SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_ca
 # 1 MB per uploaded CSV. Must stay below Starlette's 1 MiB (1,048,576-byte) SpooledTemporaryFile threshold so
 # every file we accept is held in memory and never spooled to disk (backs the privacy notice).
 MAX_FILE_BYTES = 1_000_000
-DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y")
+DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d")
 TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT") # Substrings in a description that mean an internal transfer
 TRANSFER_TYPES = {"EFT", "EFTOUT"} # Wealthsimple transaction types for moves to/from a linked bank account
 
@@ -35,7 +35,7 @@ class StatementFormatError(Exception):
 
 
 def _parse_date(cell):
-    # Handle different date formats (YYYY-MM-DD and MM-DD-YYYY)
+    # Handle different date formats (YYYY-MM-DD, MM-DD-YYYY, MM/DD/YYYY, YYYY/MM/DD)
     cell = cell.strip()
     for fmt in DATE_FORMATS:
         try:
@@ -83,7 +83,8 @@ def _map_header(header):
         if "date" in cell:
             column_map["date"] = i
         elif "description" in cell:
-            column_map["transaction_desc"] = i
+            if not cell.startswith("sub"): # e.g. Scotiabank's "Sub-description" must never replace "Description"
+                column_map.setdefault("transaction_desc", i)
         elif "transaction" in cell: # e.g. Wealthsimple's "transaction" column holds EFT / EFTOUT / SPEND
             column_map["transaction_type"] = i
         elif "amount" in cell:

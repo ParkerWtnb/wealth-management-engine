@@ -127,6 +127,29 @@ def test_description_spacing_and_case_ignored(client):
     assert totals(upload(client, files))["Total Spending"] == 4.5
 
 
+# --- Scotiabank format -------------------------------------------------------
+
+SCOTIA = (
+    '"Filter","Date","Description","Sub-description","Type of Transaction","Amount","Balance"\n'
+    '"","11/20/2026","PAYROLL","ACME CORP","Credit","788.95","788.95"\n'
+    '"","11/23/2026","GROCERY","LOBLAWS 123","Debit","-211.66","577.29"\n'
+    '"","2026/11/24","WS INVESTMENTS","TFR-TO 1234","Debit","-100.00","477.29"\n'
+)
+
+
+def test_scotia_slash_dates_and_sub_description():
+    rows = main.parse_csv("scotia.csv", SCOTIA)
+    assert [t.date.strftime("%Y-%m-%d") for t in rows] == ["2026-11-20", "2026-11-23", "2026-11-24"]
+    assert [t.transaction_desc for t in rows] == ["PAYROLL", "GROCERY", "WS INVESTMENTS"]  # Never the Sub-description
+    assert (rows[1].withdrawal, rows[1].balance) == (211.66, 577.29)
+    assert rows[2].account_type == "ws_investments"  # Classified by Description, not the "TFR-TO" Sub-description
+
+
+def test_scotia_upload_totals(client):
+    assert totals(upload(client, [("scotia.csv", SCOTIA)])) == {
+        "Total Income": 788.95, "Total Spending": 211.66, "Sent to Wealthsimple": 100.00, "Liquid Cash": 477.29}
+
+
 # --- Malformed input --------------------------------------------------------
 
 WS_HEADER = '"date","transaction","description","amount","balance","currency"\n'

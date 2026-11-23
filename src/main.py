@@ -3,10 +3,10 @@ import html
 import io
 import itertools
 import logging
-import math
 import os
 from collections import Counter
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from fastapi import FastAPI, File, UploadFile # Framework for building APIs
 from fastapi.responses import HTMLResponse, RedirectResponse # HTML pages and the / -> /dashboard redirect
@@ -19,6 +19,7 @@ SAMPLE_FILES = ("td_sept_chequing.csv", "td_sept_savings.csv", "ws_sept_spend_ca
 # 1 MB per uploaded CSV. Must stay below Starlette's 1 MiB (1,048,576-byte) SpooledTemporaryFile threshold so
 # every file we accept is held in memory and never spooled to disk (backs the privacy notice).
 MAX_FILE_BYTES = 1_000_000
+CENTS = Decimal("0.01") # Money is exact Decimal cents end to end; no binary-float rounding drift
 DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d")
 TRANSFER_MARKERS = ("TFR-FR", "TFR-TO", "EFTOUT") # Substrings in a description that mean an internal transfer
 TRANSFER_TYPES = {"EFT", "EFTOUT"} # Wealthsimple transaction types for moves to/from a linked bank account
@@ -48,11 +49,14 @@ def _parse_date(cell):
 def _parse_amount(cell):
     cell = cell.strip().replace(',', '')
     if not cell:
-        return 0.0
-    value = float(cell) # May raise ValueError; callers re-raise without the original message
-    if not math.isfinite(value): # float() happily accepts "nan" and "inf"
-        raise ValueError("non-finite amount")
-    return value
+        return Decimal("0")
+    try:
+        value = Decimal(cell)
+        if not value.is_finite(): # Decimal() happily accepts "nan" and "inf"
+            raise ValueError("non-finite amount")
+        return value.quantize(CENTS) # Raises InvalidOperation for absurdly large values like 1e30
+    except InvalidOperation:
+        raise ValueError("unreadable amount") from None # Deliberately no cell value in the message
 
 
 def _is_date(cell):
@@ -180,14 +184,14 @@ def _parse_rows(filename, text):
 
 class FinancialTotals:
     def __init__(self):
-        self.total_income = 0.0
-        self.total_spending = 0.0
-        self.total_ws_investments = 0.0
+        self.total_income = Decimal("0")
+        self.total_spending = Decimal("0")
+        self.total_ws_investments = Decimal("0")
         self.latest_balances = {}
 
     @property
     def liquid_cash(self):
-        return sum(self.latest_balances.values()) # Total liquid cash across all accounts
+        return sum(self.latest_balances.values(), Decimal("0")) # Total liquid cash across all accounts
 
     def transaction_processor(self, transactions):
         """transactions must already be sorted oldest -> newest."""
@@ -207,8 +211,7 @@ def _dedup_key(t):
     """Identity of a transaction across overlapping exports. The running balance keeps same-day
     identical purchases distinct; the filename is deliberately not part of the key."""
     description = " ".join(t.transaction_desc.split()).upper() # Ignore spacing/case differences between exports
-    amount = round(t.deposit - t.withdrawal, 2)
-    return (t.date, description, amount, round(t.balance, 2))
+    return (t.date, description, t.deposit - t.withdrawal, t.balance) # Amounts are already exact Decimal cents
 
 
 def deduplicate(parsed_files):

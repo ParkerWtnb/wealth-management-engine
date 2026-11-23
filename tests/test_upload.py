@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
@@ -141,13 +142,28 @@ def test_scotia_slash_dates_and_sub_description():
     rows = main.parse_csv("scotia.csv", SCOTIA)
     assert [t.date.strftime("%Y-%m-%d") for t in rows] == ["2026-11-20", "2026-11-23", "2026-11-24"]
     assert [t.transaction_desc for t in rows] == ["PAYROLL", "GROCERY", "WS INVESTMENTS"]  # Never the Sub-description
-    assert (rows[1].withdrawal, rows[1].balance) == (211.66, 577.29)
+    assert (rows[1].withdrawal, rows[1].balance) == (Decimal("211.66"), Decimal("577.29"))
     assert rows[2].account_type == "ws_investments"  # Classified by Description, not the "TFR-TO" Sub-description
 
 
 def test_scotia_upload_totals(client):
     assert totals(upload(client, [("scotia.csv", SCOTIA)])) == {
         "Total Income": 788.95, "Total Spending": 211.66, "Sent to Wealthsimple": 100.00, "Liquid Cash": 477.29}
+
+
+# --- Money is exact Decimal -------------------------------------------------
+
+def test_amounts_are_exact_decimals():
+    rows = "".join(f'"2026-09-{d:02}","INTEREST",,0.10,{d / 10:.2f}\n' for d in range(1, 11))
+    report = main.build_report([("savings.csv", rows)])
+    assert report.total_income == Decimal("1.00")  # Ten float 0.1s would sum to 0.9999999999999999
+    assert all(isinstance(v, Decimal) for v in (report.total_income, report.total_spending,
+                                                report.total_ws_investments, report.liquid_cash))
+
+
+def test_empty_totals_are_decimal_zero():
+    empty = main.FinancialTotals()
+    assert isinstance(empty.liquid_cash, Decimal) and empty.liquid_cash == 0
 
 
 # --- Malformed input --------------------------------------------------------
@@ -158,6 +174,8 @@ MALFORMED = {
     "bad_amount.csv": f'"2026-09-02","Coffee","{SECRET}",,"195.5"\n',
     "nan_amount.csv": '"2026-09-02","Coffee","nan",,"195.5"\n',
     "inf_balance.csv": '"2026-09-02","Coffee","4.5",,"inf"\n',
+    "huge_amount.csv": '"2026-09-02","Coffee","1e30",,"195.5"\n',
+    "snan_amount.csv": '"2026-09-02","Coffee","sNaN",,"195.5"\n',
     "short_row.csv": f'"2026-09-02","{SECRET}","4.5"\n',
     "wrong_header.csv": f"name,email\n{SECRET},someone@example.com\n",
     "ws_bad_amount.csv": WS_HEADER + f'"2026-09-01","SPEND","Tim","{SECRET}","1","CAD"\n',

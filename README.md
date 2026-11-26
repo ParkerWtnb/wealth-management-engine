@@ -9,12 +9,6 @@
 
 
 ![WME multi-bank CSV demo](https://github.com/user-attachments/assets/3f2520c9-f59c-4423-aa89-d6d6f3c0304c)
-
-
-
-
-
-
 ## Overview
 
 **Identified use case:** Consolidating fragmented multi-account and multi-institution bank statements.
